@@ -1,0 +1,59 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isHomeDir(path) {
+      return path.matches('^/home/.*');
+    }
+    
+    function isOwner(data, uid) {
+      return data.ownerId == uid;
+    }
+
+    function isValidVFSNode(data) {
+      return data.keys().hasAll(['path', 'type']) &&
+             data.path is string &&
+             data.type in ['file', 'dir'];
+    }
+
+    function isValidHistoryEntry(data) {
+      return data.keys().hasAll(['id', 'type', 'timestamp']) &&
+             data.id is string &&
+             data.type is string &&
+             data.timestamp is number;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+    
+    match /vfs/{nodeId} {
+      allow read: if isAuthenticated();
+      
+      allow create: if isAuthenticated() && 
+                    isValidVFSNode(request.resource.data) &&
+                    (!isHomeDir(request.resource.data.path) || isOwner(request.resource.data, request.auth.uid));
+                    
+      allow update: if isAuthenticated() && 
+                    isValidVFSNode(request.resource.data) &&
+                    (!isHomeDir(resource.data.path) || isOwner(resource.data, request.auth.uid)) &&
+                    (!isHomeDir(request.resource.data.path) || isOwner(request.resource.data, request.auth.uid));
+                    
+      allow delete: if isAuthenticated() && 
+                    (!isHomeDir(resource.data.path) || isOwner(resource.data, request.auth.uid));
+    }
+
+    match /history/{entryId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isValidHistoryEntry(request.resource.data);
+      allow update, delete: if false; // Append only
+    }
+  }
+}

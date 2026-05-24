@@ -1,0 +1,5 @@
+{
+  "name": "AetherTerm Collaborative",
+  "description": "A rich terminal with PiP video, image viewing, Gemini AI integration, a built-in sandbox, and real-time collaboration.",
+  "requestFramePermissions": []
+}

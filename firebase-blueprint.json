@@ -1,0 +1,44 @@
+{
+  "entities": {
+    "VFSNode": {
+      "title": "VFSNode",
+      "description": "A node in the Virtual File System",
+      "type": "object",
+      "properties": {
+        "path": { "type": "string" },
+        "type": { "type": "string", "enum": ["file", "dir"] },
+        "content": { "type": "string" },
+        "children": { "type": "array", "items": { "type": "string" } },
+        "ownerId": { "type": "string" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["path", "type"]
+    },
+    "HistoryEntry": {
+      "title": "HistoryEntry",
+      "description": "A terminal history entry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "type": "string" },
+        "text": { "type": "string" },
+        "url": { "type": "string" },
+        "pip": { "type": "boolean" },
+        "code": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "userId": { "type": "string" }
+      },
+      "required": ["id", "type", "timestamp"]
+    }
+  },
+  "firestore": {
+    "vfs/{nodeId}": {
+      "schema": "VFSNode",
+      "description": "Virtual File System nodes"
+    },
+    "history/{entryId}": {
+      "schema": "HistoryEntry",
+      "description": "Terminal history entries"
+    }
+  }
+}

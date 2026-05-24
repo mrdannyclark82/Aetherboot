@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+@keyframes breathe {
+  0%, 100% { opacity: 1; text-shadow: 0 0 12px rgba(168, 85, 247, 0.8); }
+  50% { opacity: 0.6; text-shadow: 0 0 4px rgba(168, 85, 247, 0.3); }
+}
+
+.ascii-front {
+  color: #a855f7; /* purple-500 */
+  animation: breathe 3s ease-in-out infinite;
+}
+
+.ascii-shadow {
+  color: #06b6d4; /* cyan-500 */
+}
