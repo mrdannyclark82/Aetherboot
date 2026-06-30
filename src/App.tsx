@@ -4,7 +4,7 @@ import { Terminal as TerminalIcon, Folder, File, Play, Pause, Volume2, VolumeX, 
 import { motion, AnimatePresence } from 'motion/react';
 import { auth, googleProvider, db } from './firebase';
 import { signInWithPopup, signOut, onAuthStateChanged, User } from 'firebase/auth';
-import { collection, doc, setDoc, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
+import { collection, doc, setDoc, deleteDoc, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
 
 // Types
 type VFSNode = { path: string, type: 'file' | 'dir', content?: string, children?: string[], ownerId?: string, updatedAt?: number };
@@ -58,7 +58,7 @@ export default function App() {
   const [videoOperationName, setVideoOperationName] = useState<string | null>(null);
 
   // Tab completion commands
-  const ALL_COMMANDS = ['help', 'clear', 'ls', 'cat', 'mkdir', 'touch', 'echo', 'play', 'pip', 'view', 'ask', 'generate-app', 'generate-image', 'github', 'agent', 'local-ask', 'set-boot', 'edit', 'nix', 'pkg', 'sandbox'];
+  const ALL_COMMANDS = ['help', 'clear', 'ls', 'cat', 'mkdir', 'touch', 'echo', 'play', 'pip', 'view', 'ask', 'generate-app', 'generate-image', 'github', 'github-sync', 'agent', 'local-ask', 'set-boot', 'edit', 'nix', 'pkg', 'sandbox'];
   const [onlineUsers, setOnlineUsers] = useState<string[]>([]);
   const [showSettings, setShowSettings] = useState(false);
   const [apiKeys, setApiKeys] = useState({
@@ -267,6 +267,19 @@ export default function App() {
         nodes.forEach(node => {
           const nodeToSave = { ...node, ownerId: user.uid, updatedAt: Date.now() };
           setDoc(doc(db, 'vfs', encodeURIComponent(node.path)), nodeToSave).catch(console.error);
+        });
+      }
+    });
+
+    newSocket.on('purge_vfs_paths', (paths: string[]) => {
+      setVfs(prev => {
+        const next = { ...prev };
+        paths.forEach(p => delete next[p]);
+        return next;
+      });
+      if (user) {
+        paths.forEach(p => {
+          deleteDoc(doc(db, 'vfs', encodeURIComponent(p))).catch(console.error);
         });
       }
     });

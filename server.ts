@@ -681,6 +681,7 @@ async function startServer() {
   generate-app <prompt>   - Generate an HTML/JS/CSS app and open in Sandbox
   generate-image <prompt> - Generate an image using AI
   github clone <repo>     - Clone a GitHub repository (e.g., octocat/Hello-World)
+  github-sync <url>       - Sync full nested file structure from a GitHub repo URL or owner/repo slug
   agent <name> <prompt>   - Ask a specific AI agent (coder, researcher, system)
   local-ask <prompt>      - Ask a local LLM via Ollama (requires localhost:11434)
   set-boot <url>          - Set a custom boot screen video (URL or VFS path)
@@ -978,6 +979,195 @@ Examples:
           } else {
             const output = { type: 'error', text: `Usage: github clone <owner>/<repo>`, id: Date.now().toString() + Math.random() };
             emitHistory(output);
+          }
+        } else if (command === 'github-sync') {
+          const repoUrl = args[0];
+          if (!repoUrl) {
+            emitHistory({ type: 'error', text: `Usage: github-sync <repository_url_or_slug>`, id: Date.now().toString() + Math.random() });
+            return;
+          }
+
+          let repoSlug = '';
+          let branch = '';
+          
+          if (repoUrl.includes('github.com')) {
+            try {
+              const cleanUrl = repoUrl.startsWith('http') ? repoUrl : `https://${repoUrl}`;
+              const urlObj = new URL(cleanUrl);
+              const parts = urlObj.pathname.split('/').filter(Boolean);
+              if (parts.length >= 2) {
+                repoSlug = `${parts[0]}/${parts[1].replace(/\.git$/, '')}`;
+                if (parts[2] === 'tree' && parts[3]) {
+                  branch = parts.slice(3).join('/');
+                }
+              }
+            } catch (e) {
+              repoSlug = repoUrl;
+            }
+          } else {
+            repoSlug = repoUrl;
+          }
+
+          if (!repoSlug || !repoSlug.includes('/')) {
+            emitHistory({ type: 'error', text: `Error: Invalid repository URL or path. Please provide a repository URL (e.g., https://github.com/owner/repo) or slug (owner/repo).`, id: Date.now().toString() + Math.random() });
+            return;
+          }
+
+          emitHistory({ type: 'output', text: `Initiating synchronization for ${repoSlug}...`, id: Date.now().toString() + Math.random() });
+
+          try {
+            if (!branch) {
+              const repoRes = await fetch(`https://api.github.com/repos/${repoSlug}`, {
+                headers: { 'User-Agent': 'AetherTerm-App' }
+              });
+              if (repoRes.ok) {
+                const repoData = await repoRes.json();
+                branch = repoData.default_branch || 'main';
+              } else {
+                if (repoRes.status === 403) {
+                  throw new Error("GitHub API rate limit exceeded. Please try again later.");
+                }
+                throw new Error(`Repository not found or inaccessible (HTTP ${repoRes.status})`);
+              }
+            }
+
+            emitHistory({ type: 'output', text: `Fetching repository file tree for branch '${branch}'...`, id: Date.now().toString() + Math.random() });
+
+            const treeRes = await fetch(`https://api.github.com/repos/${repoSlug}/git/trees/${branch}?recursive=true`, {
+              headers: { 'User-Agent': 'AetherTerm-App' }
+            });
+
+            if (!treeRes.ok) {
+              if (treeRes.status === 403) {
+                throw new Error("GitHub API rate limit exceeded. Please try again later.");
+              }
+              throw new Error(`Failed to retrieve git tree (HTTP ${treeRes.status})`);
+            }
+
+            const treeData = await treeRes.json();
+            if (!treeData.tree || !Array.isArray(treeData.tree)) {
+              throw new Error("Received invalid tree structure from GitHub API.");
+            }
+
+            const repoName = repoSlug.split('/')[1];
+            const targetRepoPath = `/home/${repoName}`;
+
+            // Clean up existing entries for this repository in the VFS
+            const deletedPaths: string[] = [];
+            for (const key of Object.keys(vfs)) {
+              if (key === targetRepoPath || key.startsWith(targetRepoPath + '/')) {
+                deletedPaths.push(key);
+                delete vfs[key];
+              }
+            }
+
+            if (deletedPaths.length > 0) {
+              const room = socket.data.room || 'default';
+              io.to(room).emit('purge_vfs_paths', deletedPaths);
+            }
+
+            // Ensure parent /home exists
+            if (!vfs['/home']) {
+              vfs['/home'] = { path: '/home', type: 'dir', children: [], ownerId: 'shared', updatedAt: Date.now() };
+            }
+
+            if (vfs['/home'] && vfs['/home'].type === 'dir') {
+              if (!vfs['/home'].children?.includes(targetRepoPath)) {
+                vfs['/home'].children?.push(targetRepoPath);
+              }
+            }
+
+            // Create target folder
+            vfs[targetRepoPath] = { path: targetRepoPath, type: 'dir', children: [], ownerId: 'shared', updatedAt: Date.now() };
+
+            const vfsUpdates = [vfs[targetRepoPath], vfs['/home']];
+
+            // Build directory structure first
+            for (const item of treeData.tree) {
+              const vfsPath = `${targetRepoPath}/${item.path}`;
+              const parentVfsPath = vfsPath.substring(0, vfsPath.lastIndexOf('/'));
+
+              if (item.type === 'tree') {
+                vfs[vfsPath] = {
+                  path: vfsPath,
+                  type: 'dir',
+                  children: [],
+                  ownerId: 'shared',
+                  updatedAt: Date.now()
+                };
+              } else {
+                vfs[vfsPath] = {
+                  path: vfsPath,
+                  type: 'file',
+                  content: 'Loading content...',
+                  ownerId: 'shared',
+                  updatedAt: Date.now()
+                };
+              }
+
+              // Connect to parent directory
+              if (vfs[parentVfsPath] && vfs[parentVfsPath].type === 'dir') {
+                if (!vfs[parentVfsPath].children?.includes(vfsPath)) {
+                  vfs[parentVfsPath].children?.push(vfsPath);
+                }
+                if (!vfsUpdates.includes(vfs[parentVfsPath])) {
+                  vfsUpdates.push(vfs[parentVfsPath]);
+                }
+              }
+              vfsUpdates.push(vfs[vfsPath]);
+            }
+
+            emitVfs(vfsUpdates);
+            emitHistory({ type: 'output', text: `Syncing content for text files (max 30 files)...`, id: Date.now().toString() + Math.random() });
+
+            // Concurrent fetch of top 30 file contents
+            const blobItems = treeData.tree.filter((item: any) => item.type === 'blob');
+            const MAX_FETCH = 30;
+            const fetchSlice = blobItems.slice(0, MAX_FETCH);
+
+            await Promise.all(fetchSlice.map(async (item: any) => {
+              const vfsPath = `${targetRepoPath}/${item.path}`;
+              try {
+                const fileUrl = `https://raw.githubusercontent.com/${repoSlug}/${branch}/${item.path}`;
+                const fileRes = await fetch(fileUrl);
+                if (fileRes.ok) {
+                  const content = await fileRes.text();
+                  if (vfs[vfsPath]) {
+                    vfs[vfsPath].content = content;
+                  }
+                } else {
+                  if (vfs[vfsPath]) {
+                    vfs[vfsPath].content = `[Content download failed: HTTP ${fileRes.status}]`;
+                  }
+                }
+              } catch (fileErr: any) {
+                if (vfs[vfsPath]) {
+                  vfs[vfsPath].content = `[Content download failed: ${fileErr.message}]`;
+                }
+              }
+            }));
+
+            // Handle skipped files content placeholders
+            if (blobItems.length > MAX_FETCH) {
+              for (const item of blobItems.slice(MAX_FETCH)) {
+                const vfsPath = `${targetRepoPath}/${item.path}`;
+                if (vfs[vfsPath]) {
+                  vfs[vfsPath].content = `[Content skipped to optimize sync time. Total files in repo: ${blobItems.length}. Raw URL: https://raw.githubusercontent.com/${repoSlug}/${branch}/${item.path}]`;
+                }
+              }
+            }
+
+            // Emit the updated VFS to sync the client-side UI
+            emitVfs(Object.values(vfs));
+
+            emitHistory({
+              type: 'output',
+              text: `[Success]: Synchronized ${blobItems.length} files from ${repoSlug} (branch: ${branch}) to ${targetRepoPath}`,
+              id: Date.now().toString() + Math.random()
+            });
+
+          } catch (err: any) {
+            emitHistory({ type: 'error', text: `Sync failed: ${err.message}`, id: Date.now().toString() + Math.random() });
           }
         } else if (command === 'agent') {
           const agentName = args[0];
