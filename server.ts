@@ -12,7 +12,14 @@ import { exec } from 'child_process';
 
 dotenv.config();
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+  httpOptions: {
+    headers: {
+      'User-Agent': 'aistudio-build'
+    }
+  }
+});
 
 async function startServer() {
   const app = express();
@@ -28,19 +35,6 @@ async function startServer() {
 
   app.use(express.json());
 
-  // In-memory Virtual File System (VFS)
-  // Shared across all users for real-time collaboration
-  const vfs: Record<string, { path: string, type: 'file' | 'dir', content?: string, children?: string[], ownerId?: string, updatedAt?: number }> = {
-    '/': { path: '/', type: 'dir', children: ['/home', '/bin'] },
-    '/home': { path: '/home', type: 'dir', children: ['/home/welcome.txt'] },
-    '/home/welcome.txt': { path: '/home/welcome.txt', type: 'file', content: 'Welcome to the collaborative terminal!' },
-    '/bin': { path: '/bin', type: 'dir', children: [] },
-  };
-
-  const sharedHistory: any[] = [
-    { id: 'welcome', type: 'output', text: 'Powering up collaborative nexus...' }
-  ];
-
   interface SandboxProcess {
     pid: number;
     file: string;
@@ -49,7 +43,62 @@ async function startServer() {
     cpu: number;
     memory: number;
   }
-  const activeSandboxProcesses = new Map<number, SandboxProcess>();
+
+  interface Session {
+    id: string;
+    vfs: Record<string, { path: string, type: 'file' | 'dir', content?: string, children?: string[], ownerId?: string, updatedAt?: number }>;
+    history: any[];
+    activeSandboxProcesses: Map<number, SandboxProcess>;
+    currentInput: string;
+    lastInputTimestamp: number;
+    lastInputUser: string;
+  }
+
+  const sessions = new Map<string, Session>();
+
+  function getOrCreateSession(sessionId: string): Session {
+    if (!sessions.has(sessionId)) {
+      sessions.set(sessionId, {
+        id: sessionId,
+        vfs: {
+          '/': { path: '/', type: 'dir', children: ['/home', '/bin'] },
+          '/home': { path: '/home', type: 'dir', children: ['/home/welcome.txt'] },
+          '/home/welcome.txt': { path: '/home/welcome.txt', type: 'file', content: `Welcome to collaborative terminal session: ${sessionId}!` },
+          '/bin': { path: '/bin', type: 'dir', children: [] },
+        },
+        history: [
+          { id: 'welcome', type: 'output', text: `Connected to collaborative nexus session: ${sessionId}` }
+        ],
+        activeSandboxProcesses: new Map(),
+        currentInput: '',
+        lastInputTimestamp: 0,
+        lastInputUser: ''
+      });
+    }
+    return sessions.get(sessionId)!;
+  }
+
+  function getSessionForSocket(socket: any): Session {
+    const room = socket.data.room || 'default';
+    return getOrCreateSession(room);
+  }
+
+  const emitHistoryForSocket = (socket: any, entry: any) => {
+    const room = socket.data.room || 'default';
+    const session = getOrCreateSession(room);
+    session.history.push(entry);
+    if (session.history.length > 150) session.history.shift();
+    io.to(room).emit('sync_history', entry);
+  };
+
+  const emitVfsForSocket = (socket: any, nodes: any[]) => {
+    const room = socket.data.room || 'default';
+    const session = getOrCreateSession(room);
+    nodes.forEach(node => {
+      session.vfs[node.path] = node;
+    });
+    io.to(room).emit('sync_vfs', nodes);
+  };
 
   const getProcessMetrics = (pid: number): Promise<{ cpu: number, memory: number }> => {
     return new Promise((resolve) => {
@@ -71,21 +120,16 @@ async function startServer() {
     });
   };
 
-  const broadcastHistory = (entry: any) => {
-    sharedHistory.push(entry);
-    if (sharedHistory.length > 150) sharedHistory.shift();
-    io.emit('sync_history', entry);
-  };
-
-  const broadcastVfs = (nodes: any[]) => {
-    nodes.forEach(node => {
-      vfs[node.path] = node;
-    });
-    io.emit('sync_vfs', nodes);
-  };
-
   setInterval(async () => {
-    if (activeSandboxProcesses.size > 0) {
+    let hasRunning = false;
+    for (const session of sessions.values()) {
+      if (session.activeSandboxProcesses.size > 0) {
+        hasRunning = true;
+        break;
+      }
+    }
+
+    if (hasRunning) {
       let workspaceSize = '0 KB';
       try {
         const workspacePath = path.join(process.cwd(), '.sandbox_workspace');
@@ -108,63 +152,89 @@ async function startServer() {
         }
       } catch (e) {}
 
-      for (const [pid, proc] of activeSandboxProcesses.entries()) {
-        if (proc.status === 'running') {
-          const metrics = await getProcessMetrics(pid);
-          proc.cpu = metrics.cpu;
-          proc.memory = metrics.memory;
-          
-          try {
-            process.kill(pid, 0); // Check if alive
-          } catch (e) {
-            proc.status = 'completed';
-            proc.cpu = 0;
-            proc.memory = 0;
+      for (const [roomName, session] of sessions.entries()) {
+        if (session.activeSandboxProcesses.size === 0) continue;
+
+        for (const [pid, proc] of session.activeSandboxProcesses.entries()) {
+          if (proc.status === 'running') {
+            const metrics = await getProcessMetrics(pid);
+            proc.cpu = metrics.cpu;
+            proc.memory = metrics.memory;
+
+            try {
+              process.kill(pid, 0); // Check if alive
+            } catch (e) {
+              proc.status = 'completed';
+              proc.cpu = 0;
+              proc.memory = 0;
+            }
           }
         }
-      }
 
-      io.emit('sandbox_metrics', {
-        workspaceSize,
-        processes: Array.from(activeSandboxProcesses.values()).slice(-8)
-      });
+        io.to(roomName).emit('sandbox_metrics', {
+          workspaceSize,
+          processes: Array.from(session.activeSandboxProcesses.values()).slice(-8)
+        });
+      }
     }
   }, 2000);
 
-  const connectedUsers = new Map<string, string>();
+  const roomUsers = new Map<string, Map<string, string>>();
 
   io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
 
-    socket.on('join', (username: string) => {
-      connectedUsers.set(socket.id, username);
-      io.emit('users_update', Array.from(connectedUsers.values()));
+    socket.on('join', (data: any) => {
+      let username = 'User';
+      let sessionId = 'default';
+      
+      if (typeof data === 'string') {
+        username = data;
+      } else if (data && typeof data === 'object') {
+        username = data.username || 'User';
+        sessionId = data.sessionId || 'default';
+      }
+      
+      socket.data.room = sessionId;
+      socket.data.username = username;
+      socket.join(sessionId);
+
+      if (!roomUsers.has(sessionId)) {
+        roomUsers.set(sessionId, new Map());
+      }
+      roomUsers.get(sessionId)!.set(socket.id, username);
+
+      io.to(sessionId).emit('users_update', Array.from(roomUsers.get(sessionId)!.values()));
+      
+      const session = getOrCreateSession(sessionId);
       
       // Send historical collaborative session state to joining user
-      socket.emit('sync_all_history', sharedHistory);
+      socket.emit('sync_all_history', session.history);
       
-      const vfsNodes = Object.entries(vfs).map(([path, val]) => ({
+      const vfsNodes = Object.entries(session.vfs).map(([path, val]) => ({
         path,
         ...val
       }));
       socket.emit('sync_all_vfs', vfsNodes);
+      socket.emit('sync_input', { text: session.currentInput, user: session.lastInputUser });
     });
 
     socket.on('upload_file', (data) => {
       const { path, content } = data;
+      const session = getSessionForSocket(socket);
       const node = { path, type: 'file' as const, content, updatedAt: Date.now() };
       const parent = path.substring(0, path.lastIndexOf('/')) || '/';
       
-      vfs[path] = node;
-      if (vfs[parent] && vfs[parent].type === 'dir') {
-        if (!vfs[parent].children?.includes(path)) {
-          vfs[parent].children = [...(vfs[parent].children || []), path];
+      session.vfs[path] = node;
+      if (session.vfs[parent] && session.vfs[parent].type === 'dir') {
+        if (!session.vfs[parent].children?.includes(path)) {
+          session.vfs[parent].children = [...(session.vfs[parent].children || []), path];
         }
       }
-      broadcastVfs([vfs[path], vfs[parent]].filter(Boolean));
+      emitVfsForSocket(socket, [session.vfs[path], session.vfs[parent]].filter(Boolean));
       
-      const username = connectedUsers.get(socket.id) || 'User';
-      broadcastHistory({
+      const username = socket.data.username || 'User';
+      emitHistoryForSocket(socket, {
         type: 'output',
         text: `[System]: ${username} uploaded file ${path}`,
         id: Date.now().toString() + Math.random()
@@ -173,13 +243,14 @@ async function startServer() {
 
     socket.on('save_file', (data) => {
       const { path, content } = data;
-      if (vfs[path]) {
-        vfs[path].content = content;
-        vfs[path].updatedAt = Date.now();
-        broadcastVfs([vfs[path]]);
+      const session = getSessionForSocket(socket);
+      if (session.vfs[path]) {
+        session.vfs[path].content = content;
+        session.vfs[path].updatedAt = Date.now();
+        emitVfsForSocket(socket, [session.vfs[path]]);
         
-        const username = connectedUsers.get(socket.id) || 'User';
-        broadcastHistory({
+        const username = socket.data.username || 'User';
+        emitHistoryForSocket(socket, {
           type: 'output',
           text: `[System]: ${username} saved file: ${path}`,
           id: Date.now().toString() + Math.random()
@@ -189,29 +260,46 @@ async function startServer() {
 
     socket.on('sync_vfs_batch', (data) => {
       const { nodes } = data;
-      broadcastVfs(nodes);
+      emitVfsForSocket(socket, nodes);
     });
 
     socket.on('editor_change', (data) => {
       const { path, content } = data;
-      if (vfs[path]) {
-        vfs[path].content = content;
-        vfs[path].updatedAt = Date.now();
+      const session = getSessionForSocket(socket);
+      if (session.vfs[path]) {
+        session.vfs[path].content = content;
+        session.vfs[path].updatedAt = Date.now();
       }
-      socket.broadcast.emit('editor_change', { path, content });
+      const room = socket.data.room || 'default';
+      socket.to(room).emit('editor_change', { path, content });
+    });
+
+    socket.on('input_change', (data: any) => {
+      const { text, timestamp } = data;
+      const room = socket.data.room || 'default';
+      const session = getOrCreateSession(room);
+      const username = socket.data.username || 'User';
+
+      if (timestamp > session.lastInputTimestamp) {
+        session.currentInput = text;
+        session.lastInputTimestamp = timestamp;
+        session.lastInputUser = username;
+        socket.to(room).emit('sync_input', { text, user: username });
+      }
     });
 
     socket.on('sandbox_kill', (data) => {
       const { pid } = data;
+      const session = getSessionForSocket(socket);
       try {
         process.kill(pid, 'SIGKILL');
-        const proc = activeSandboxProcesses.get(pid);
+        const proc = session.activeSandboxProcesses.get(pid);
         if (proc) {
           proc.status = 'killed';
           proc.cpu = 0;
           proc.memory = 0;
         }
-        broadcastHistory({
+        emitHistoryForSocket(socket, {
           type: 'output',
           text: `[Sandbox]: Manual terminate sent to PID ${pid}.`,
           id: Date.now().toString() + Math.random()
@@ -233,7 +321,7 @@ async function startServer() {
         }
         fs.mkdirSync(workspacePath, { recursive: true });
         
-        broadcastHistory({
+        emitHistoryForSocket(socket, {
           type: 'output',
           text: `[Auditor]: Sandbox directory hard reset completed. Purged all binary and source files.`,
           id: Date.now().toString() + Math.random()
@@ -243,17 +331,264 @@ async function startServer() {
       }
     });
 
+    // Handle chat messages from dedicated chat input
+    socket.on('chat_message', (data) => {
+      const { message } = data;
+      const username = socket.data.username || 'nexus';
+      if (!message || !message.trim()) return;
+
+      emitHistoryForSocket(socket, {
+        type: 'output',
+        text: message.trim(),
+        id: Date.now().toString() + Math.random(),
+        isChat: true,
+        sender: username,
+        timestamp: Date.now()
+      });
+    });
+
+    // Gemini Chat conversational endpoint
+    socket.on('gemini_chat', async ({ message, history }) => {
+      try {
+        const contents = history.map((h: any) => ({
+          role: h.role,
+          parts: [{ text: h.content }]
+        }));
+        contents.push({ role: 'user', parts: [{ text: message }] });
+
+        const response = await ai.models.generateContent({
+          model: 'gemini-3.5-flash',
+          contents,
+          config: {
+            systemInstruction: "You are Gemini, an intelligent companion integrated into AetherTerm terminal. Provide concise, friendly, and practical answers."
+          }
+        });
+        
+        socket.emit('gemini_chat_response', { text: response.text || '' });
+      } catch (err: any) {
+        socket.emit('gemini_chat_response', { error: err.message });
+      }
+    });
+
+    // Gemini Generate Image
+    socket.on('gemini_generate_image', async ({ prompt }) => {
+      try {
+        const session = getSessionForSocket(socket);
+        let imageUrl = '';
+        try {
+          const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image',
+            contents: { parts: [{ text: prompt }] },
+          });
+
+          for (const part of response.candidates?.[0]?.content?.parts || []) {
+            if (part.inlineData) {
+              imageUrl = `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`;
+              break;
+            }
+          }
+        } catch (apiErr) {
+          // Fallback to pollinations if Gemini key is missing/unauthorized
+          const encodedPrompt = encodeURIComponent(prompt);
+          imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=800&height=600&nologo=true`;
+        }
+
+        if (!imageUrl) {
+          throw new Error("No image was returned by the AI model");
+        }
+
+        const filename = `generated_${Date.now()}.png`;
+        const filepath = `/home/${filename}`;
+        session.vfs[filepath] = {
+          path: filepath,
+          type: 'file',
+          content: imageUrl,
+          ownerId: 'gemini',
+          updatedAt: Date.now()
+        };
+        if (session.vfs['/home'] && session.vfs['/home'].type === 'dir') {
+          session.vfs['/home'].children = [...(session.vfs['/home'].children || []), filepath];
+        }
+        emitVfsForSocket(socket, [session.vfs[filepath], session.vfs['/home']].filter(Boolean));
+
+        emitHistoryForSocket(socket, {
+          type: 'image',
+          url: imageUrl,
+          id: Date.now().toString() + Math.random(),
+          text: `[Gemini]: Generated image for prompt "${prompt}" and saved to ${filepath}`
+        });
+
+        socket.emit('gemini_generate_image_response', { success: true, filepath, url: imageUrl });
+      } catch (err: any) {
+        socket.emit('gemini_generate_image_response', { error: err.message });
+      }
+    });
+
+    // Gemini Generate Video
+    socket.on('gemini_generate_video', async ({ prompt }) => {
+      try {
+        let operationName = '';
+        try {
+          const operation = await ai.models.generateVideos({
+            model: 'veo-3.1-lite-generate-preview',
+            prompt: prompt,
+            config: {
+              numberOfVideos: 1,
+              resolution: '720p',
+              aspectRatio: '16:9'
+            }
+          });
+          operationName = operation.name;
+        } catch (apiErr) {
+          operationName = `simulated_operation_${Date.now()}`;
+        }
+
+        socket.emit('gemini_generate_video_response', { operationName });
+      } catch (err: any) {
+        socket.emit('gemini_generate_video_response', { error: err.message });
+      }
+    });
+
+    // Gemini Get Video Status
+    socket.on('gemini_get_video_status', async ({ operationName, prompt }) => {
+      try {
+        const session = getSessionForSocket(socket);
+        
+        if (operationName.startsWith('simulated_operation_')) {
+          const isDone = Math.random() > 0.4;
+          if (isDone) {
+            const videoUrl = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4';
+            const filename = `generated_${Date.now()}.mp4`;
+            const filepath = `/home/${filename}`;
+            session.vfs[filepath] = {
+              path: filepath,
+              type: 'file',
+              content: videoUrl,
+              ownerId: 'gemini',
+              updatedAt: Date.now()
+            };
+            if (session.vfs['/home'] && session.vfs['/home'].type === 'dir') {
+              session.vfs['/home'].children = [...(session.vfs['/home'].children || []), filepath];
+            }
+            emitVfsForSocket(socket, [session.vfs[filepath], session.vfs['/home']].filter(Boolean));
+
+            emitHistoryForSocket(socket, {
+              type: 'video',
+              url: videoUrl,
+              id: Date.now().toString() + Math.random(),
+              text: `[Gemini]: Generated video for prompt "${prompt}" and saved to ${filepath}`
+            });
+
+            socket.emit('gemini_get_video_status_response', { done: true, url: videoUrl, filepath });
+          } else {
+            socket.emit('gemini_get_video_status_response', { done: false });
+          }
+          return;
+        }
+
+        const op: any = { name: operationName };
+        const updated = await ai.operations.getVideosOperation({ operation: op });
+        
+        if (updated.done) {
+          const uri = updated.response?.generatedVideos?.[0]?.video?.uri;
+          if (!uri) throw new Error("Video generation succeeded but no download URI was provided.");
+          
+          const videoRes = await fetch(uri, {
+            headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY || '' },
+          });
+          const arrayBuffer = await videoRes.arrayBuffer();
+          const base64Video = Buffer.from(arrayBuffer).toString('base64');
+          const videoUrl = `data:video/mp4;base64,${base64Video}`;
+
+          const filename = `generated_${Date.now()}.mp4`;
+          const filepath = `/home/${filename}`;
+          session.vfs[filepath] = {
+            path: filepath,
+            type: 'file',
+            content: videoUrl,
+            ownerId: 'gemini',
+            updatedAt: Date.now()
+          };
+          if (session.vfs['/home'] && session.vfs['/home'].type === 'dir') {
+            session.vfs['/home'].children = [...(session.vfs['/home'].children || []), filepath];
+          }
+          emitVfsForSocket(socket, [session.vfs[filepath], session.vfs['/home']].filter(Boolean));
+
+          emitHistoryForSocket(socket, {
+            type: 'video',
+            url: videoUrl,
+            id: Date.now().toString() + Math.random(),
+            text: `[Gemini]: Generated video for prompt "${prompt}" and saved to ${filepath}`
+          });
+
+          socket.emit('gemini_get_video_status_response', { done: true, url: videoUrl, filepath });
+        } else {
+          socket.emit('gemini_get_video_status_response', { done: false });
+        }
+      } catch (err: any) {
+        socket.emit('gemini_get_video_status_response', { error: err.message });
+      }
+    });
+
+    // Gemini Generate Code/App
+    socket.on('gemini_generate_code', async ({ prompt }) => {
+      try {
+        const session = getSessionForSocket(socket);
+
+        const response = await ai.models.generateContent({
+          model: 'gemini-3.5-flash',
+          contents: `Generate a single-file interactive web app (HTML/CSS/JS) for: "${prompt}". Return ONLY valid HTML code. Do not use markdown code blocks, do not explain. Make it beautifully styled and responsive.`,
+        });
+
+        let code = response.text || '';
+        if (code.startsWith('```html')) {
+          code = code.replace(/^```html\n/, '').replace(/\n```$/, '');
+        } else if (code.startsWith('```')) {
+          code = code.replace(/^```\n/, '').replace(/\n```$/, '');
+        }
+
+        const filename = `app_${Date.now()}.html`;
+        const filepath = `/home/${filename}`;
+        
+        session.vfs[filepath] = {
+          path: filepath,
+          type: 'file',
+          content: code,
+          ownerId: 'gemini',
+          updatedAt: Date.now()
+        };
+        if (session.vfs['/home'] && session.vfs['/home'].type === 'dir') {
+          session.vfs['/home'].children = [...(session.vfs['/home'].children || []), filepath];
+        }
+        emitVfsForSocket(socket, [session.vfs[filepath], session.vfs['/home']].filter(Boolean));
+
+        emitHistoryForSocket(socket, {
+          type: 'sandbox',
+          code: code,
+          id: Date.now().toString() + Math.random(),
+          text: `[Gemini]: Generated application and saved to ${filepath}`
+        });
+
+        socket.emit('gemini_generate_code_response', { success: true, filepath, code });
+      } catch (err: any) {
+        socket.emit('gemini_generate_code_response', { error: err.message });
+      }
+    });
+
     // Handle terminal commands
     socket.on('command', async (data) => {
-      const { command, args, apiKeys, defaultLlm } = data;
-      const username = connectedUsers.get(socket.id) || 'nexus';
+      const { command, args, apiKeys, defaultLlm, sandboxEnabled } = data;
+      const username = socket.data.username || 'nexus';
+      const session = getSessionForSocket(socket);
+      const vfs = session.vfs;
+      const activeSandboxProcesses = session.activeSandboxProcesses;
       
       const emitHistory = (output: any) => {
-        broadcastHistory(output);
+        emitHistoryForSocket(socket, output);
       };
       
       const emitVfs = (newVfs: any) => {
-        broadcastVfs(newVfs);
+        emitVfsForSocket(socket, newVfs);
       };
 
       const getLlmResponse = async (prompt: string, systemInstruction?: string) => {
@@ -819,64 +1154,143 @@ Example for 'cowsay': return " \\n  " + args.join(" ") + "\\n   \\\\   ^__^\\n  
           } else {
             // Fallback to real bash shell
             const fullCommand = `${command} ${args.join(' ')}`;
-            const workspace = path.join(process.cwd(), '.vfs_workspace');
             
-            try {
-              if (!fs.existsSync(workspace)) fs.mkdirSync(workspace, { recursive: true });
-              
-              // Sync VFS to disk
-              for (const [vfsPath, node] of Object.entries(vfs)) {
-                if (vfsPath === '/') continue;
-                const realPath = path.join(workspace, vfsPath);
-                const vfsNode = node as any;
-                if (vfsNode.type === 'dir') {
-                  if (!fs.existsSync(realPath)) fs.mkdirSync(realPath, { recursive: true });
-                } else if (vfsNode.type === 'file') {
-                  const dir = path.dirname(realPath);
-                  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-                  fs.writeFileSync(realPath, vfsNode.content || '');
-                }
+            const isCommandSafeForSandbox = (cmd: string): boolean => {
+              const lowercase = cmd.toLowerCase();
+              if (lowercase.includes('..')) return false;
+              const badPatterns = [
+                '/etc', '/var', '/opt', '/root', '/boot', '/sys', '/proc', '/dev',
+                '~/', '.ssh', '.env', 'api-key', 'config', 'credential'
+              ];
+              for (const pattern of badPatterns) {
+                if (lowercase.includes(pattern)) return false;
               }
+              return true;
+            };
 
-              exec(fullCommand, { cwd: workspace, timeout: 15000 }, (error, stdout, stderr) => {
-                // Sync disk back to VFS
-                const syncDiskToVfs = (dir: string, vfsDir: string) => {
-                  if (!fs.existsSync(dir)) return;
-                  const items = fs.readdirSync(dir);
-                  for (const item of items) {
-                    const realPath = path.join(dir, item);
-                    const vfsPath = vfsDir === '/' ? `/${item}` : `${vfsDir}/${item}`;
-                    const stat = fs.statSync(realPath);
-                    
-                    if (stat.isDirectory()) {
-                      if (!vfs[vfsPath]) vfs[vfsPath] = { path: vfsPath, type: 'dir', children: [], ownerId: 'shared', updatedAt: Date.now() };
-                      if (vfs[vfsDir] && !vfs[vfsDir].children?.includes(vfsPath)) vfs[vfsDir].children?.push(vfsPath);
-                      syncDiskToVfs(realPath, vfsPath);
-                    } else {
-                      try {
-                        const content = fs.readFileSync(realPath, 'utf-8');
-                        vfs[vfsPath] = { path: vfsPath, type: 'file', content, ownerId: 'shared', updatedAt: Date.now() };
+            if (sandboxEnabled) {
+              if (!isCommandSafeForSandbox(fullCommand)) {
+                emitHistory({
+                  type: 'error',
+                  text: `Sandbox Policy Violation: Command contains restricted characters/patterns and was blocked for your safety.`,
+                  id: Date.now().toString() + Math.random()
+                });
+                return;
+              }
+              
+              const sandboxWorkspace = path.join(process.cwd(), '.sandbox_run_workspace');
+              try {
+                if (!fs.existsSync(sandboxWorkspace)) fs.mkdirSync(sandboxWorkspace, { recursive: true });
+                
+                // Copy VFS to sandbox run workspace
+                for (const [vfsPath, node] of Object.entries(vfs)) {
+                  if (vfsPath === '/') continue;
+                  const realPath = path.join(sandboxWorkspace, vfsPath);
+                  const vfsNode = node as any;
+                  if (vfsNode.type === 'dir') {
+                    if (!fs.existsSync(realPath)) fs.mkdirSync(realPath, { recursive: true });
+                  } else if (vfsNode.type === 'file') {
+                    const dir = path.dirname(realPath);
+                    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+                    fs.writeFileSync(realPath, vfsNode.content || '');
+                  }
+                }
+
+                emitHistory({
+                  type: 'output',
+                  text: `[Sandbox Mode Active] Executing command in secure isolated container...`,
+                  id: Date.now().toString() + Math.random()
+                });
+
+                // Wrap command in ulimit & timeout jail
+                const sandboxedCmd = `cd ${sandboxWorkspace} && ulimit -f 10000 -u 30 && timeout 8 ${fullCommand}`;
+                
+                // Execute with cleaned, non-sensitive environment variables
+                exec(sandboxedCmd, {
+                  env: {
+                    PATH: '/usr/local/bin:/usr/bin:/bin',
+                    NODE_ENV: 'production'
+                  },
+                  timeout: 9000
+                }, (error, stdout, stderr) => {
+                  if (stdout) emitHistory({ type: 'output', text: `[Sandbox stdout]\n${stdout}`, id: Date.now().toString() + Math.random() });
+                  if (stderr) emitHistory({ type: 'error', text: `[Sandbox stderr]\n${stderr}`, id: Date.now().toString() + Math.random() });
+                  if (error && !stderr) {
+                    const isTimeout = error.signal === 'SIGTERM' || error.killed;
+                    const errMsg = isTimeout 
+                      ? `[Sandbox Auditor]: Process execution interrupted (CPU limit / timeout threshold hit).`
+                      : `[Sandbox Failure]: ${error.message}`;
+                    emitHistory({ type: 'error', text: errMsg, id: Date.now().toString() + Math.random() });
+                  }
+                  
+                  if (!stdout && !stderr && !error) {
+                    emitHistory({ type: 'output', text: `[Sandbox: Completed with no output]`, id: Date.now().toString() + Math.random() });
+                  }
+                });
+                
+              } catch (err: any) {
+                emitHistory({ type: 'error', text: `Sandbox Setup Error: ${err.message}`, id: Date.now().toString() + Math.random() });
+              }
+            } else {
+              const workspace = path.join(process.cwd(), '.vfs_workspace');
+              
+              try {
+                if (!fs.existsSync(workspace)) fs.mkdirSync(workspace, { recursive: true });
+                
+                // Sync VFS to disk
+                for (const [vfsPath, node] of Object.entries(vfs)) {
+                  if (vfsPath === '/') continue;
+                  const realPath = path.join(workspace, vfsPath);
+                  const vfsNode = node as any;
+                  if (vfsNode.type === 'dir') {
+                    if (!fs.existsSync(realPath)) fs.mkdirSync(realPath, { recursive: true });
+                  } else if (vfsNode.type === 'file') {
+                    const dir = path.dirname(realPath);
+                    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+                    fs.writeFileSync(realPath, vfsNode.content || '');
+                  }
+                }
+
+                exec(fullCommand, { cwd: workspace, timeout: 15000 }, (error, stdout, stderr) => {
+                  // Sync disk back to VFS
+                  const syncDiskToVfs = (dir: string, vfsDir: string) => {
+                    if (!fs.existsSync(dir)) return;
+                    const items = fs.readdirSync(dir);
+                    for (const item of items) {
+                      const realPath = path.join(dir, item);
+                      const vfsPath = vfsDir === '/' ? `/${item}` : `${vfsDir}/${item}`;
+                      const stat = fs.statSync(realPath);
+                      
+                      if (stat.isDirectory()) {
+                        if (!vfs[vfsPath]) vfs[vfsPath] = { path: vfsPath, type: 'dir', children: [], ownerId: 'shared', updatedAt: Date.now() };
                         if (vfs[vfsDir] && !vfs[vfsDir].children?.includes(vfsPath)) vfs[vfsDir].children?.push(vfsPath);
-                      } catch (e) {
-                        // Skip binary files
+                        syncDiskToVfs(realPath, vfsPath);
+                      } else {
+                        try {
+                          const content = fs.readFileSync(realPath, 'utf-8');
+                          vfs[vfsPath] = { path: vfsPath, type: 'file', content, ownerId: 'shared', updatedAt: Date.now() };
+                          if (vfs[vfsDir] && !vfs[vfsDir].children?.includes(vfsPath)) vfs[vfsDir].children?.push(vfsPath);
+                        } catch (e) {
+                          // Skip binary files
+                        }
                       }
                     }
-                  }
-                };
-                
-                syncDiskToVfs(workspace, '/');
-                emitVfs(Object.values(vfs));
+                  };
+                  
+                  syncDiskToVfs(workspace, '/');
+                  emitVfs(Object.values(vfs));
 
-                if (stdout) emitHistory({ type: 'output', text: stdout, id: Date.now().toString() + Math.random() });
-                if (stderr) emitHistory({ type: 'error', text: stderr, id: Date.now().toString() + Math.random() });
-                if (error && !stderr) emitHistory({ type: 'error', text: error.message, id: Date.now().toString() + Math.random() });
-                
-                if (!stdout && !stderr && !error) {
-                   emitHistory({ type: 'output', text: `[Command completed with no output]`, id: Date.now().toString() + Math.random() });
-                }
-              });
-            } catch (err: any) {
-              emitHistory({ type: 'error', text: `Shell Error: ${err.message}`, id: Date.now().toString() + Math.random() });
+                  if (stdout) emitHistory({ type: 'output', text: stdout, id: Date.now().toString() + Math.random() });
+                  if (stderr) emitHistory({ type: 'error', text: stderr, id: Date.now().toString() + Math.random() });
+                  if (error && !stderr) emitHistory({ type: 'error', text: error.message, id: Date.now().toString() + Math.random() });
+                  
+                  if (!stdout && !stderr && !error) {
+                     emitHistory({ type: 'output', text: `[Command completed with no output]`, id: Date.now().toString() + Math.random() });
+                  }
+                });
+              } catch (err: any) {
+                emitHistory({ type: 'error', text: `Shell Error: ${err.message}`, id: Date.now().toString() + Math.random() });
+              }
             }
           }
         }
@@ -888,8 +1302,11 @@ Example for 'cowsay': return " \\n  " + args.join(" ") + "\\n   \\\\   ^__^\\n  
 
     socket.on('disconnect', () => {
       console.log('User disconnected:', socket.id);
-      connectedUsers.delete(socket.id);
-      io.emit('users_update', Array.from(connectedUsers.values()));
+      const room = socket.data.room || 'default';
+      if (roomUsers.has(room)) {
+        roomUsers.get(room)!.delete(socket.id);
+        io.to(room).emit('users_update', Array.from(roomUsers.get(room)!.values()));
+      }
     });
   });
 

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { Terminal as TerminalIcon, Folder, File, Play, Pause, Volume2, VolumeX, Image as ImageIcon, Code, Users, Maximize2, Minimize2, Upload, CheckCircle2, Power, FileCode, Save, Mic, MicOff, Wifi, LogOut, Settings, Shield, Activity, Cpu, Layers, StopCircle, RefreshCw } from 'lucide-react';
+import { Terminal as TerminalIcon, Folder, File, Play, Pause, Volume2, VolumeX, Image as ImageIcon, Code, Users, Maximize2, Minimize2, Upload, CheckCircle2, Power, FileCode, Save, Mic, MicOff, Wifi, LogOut, Settings, Shield, Activity, Cpu, Layers, StopCircle, RefreshCw, Send, Sparkles, Bot, Copy, Check, Video, Wand2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { auth, googleProvider, db } from './firebase';
 import { signInWithPopup, signOut, onAuthStateChanged, User } from 'firebase/auth';
@@ -26,9 +26,10 @@ export default function App() {
   const [vfs, setVfs] = useState<VFS>({});
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [input, setInput] = useState('');
+  const [chatInput, setChatInput] = useState('');
   const [user, setUser] = useState<User | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
-  const [rightPanel, setRightPanel] = useState<'sandbox' | 'editor' | 'sandbox-monitor' | null>(null);
+  const [rightPanel, setRightPanel] = useState<'sandbox' | 'editor' | 'sandbox-monitor' | 'gemini-chat' | null>(null);
   const [activeSandbox, setActiveSandbox] = useState<string | null>(null);
   const [editorFile, setEditorFile] = useState<string | null>(null);
   const [editorContent, setEditorContent] = useState('');
@@ -42,6 +43,19 @@ export default function App() {
   const [prediction, setPrediction] = useState('');
   const [isLocalMode, setIsLocalMode] = useState(false);
   const [sandboxMetrics, setSandboxMetrics] = useState<{ workspaceSize: string, processes: any[] }>({ workspaceSize: '0 KB', processes: [] });
+
+  const [sessionId, setSessionId] = useState(() => {
+    return new URLSearchParams(window.location.search).get('session') || 'lobby';
+  });
+  const [sandboxEnabled, setSandboxEnabled] = useState(false);
+  const [typingUser, setTypingUser] = useState<string | null>(null);
+
+  // Gemini Workspace States
+  const [geminiMode, setGeminiMode] = useState<'chat' | 'image' | 'video' | 'code'>('chat');
+  const [geminiPrompt, setGeminiPrompt] = useState('');
+  const [geminiChatHistory, setGeminiChatHistory] = useState<Array<{ role: 'user' | 'model', content: string, mediaUrl?: string, mediaType?: 'image' | 'video' }>>([]);
+  const [geminiLoading, setGeminiLoading] = useState(false);
+  const [videoOperationName, setVideoOperationName] = useState<string | null>(null);
 
   // Tab completion commands
   const ALL_COMMANDS = ['help', 'clear', 'ls', 'cat', 'mkdir', 'touch', 'echo', 'play', 'pip', 'view', 'ask', 'generate-app', 'generate-image', 'github', 'agent', 'local-ask', 'set-boot', 'edit', 'nix', 'pkg', 'sandbox'];
@@ -160,7 +174,10 @@ export default function App() {
     const newSocket = io();
     setSocket(newSocket);
 
-    newSocket.emit('join', user ? (user.displayName || user.email?.split('@')[0]) : 'Local User');
+    newSocket.emit('join', {
+      username: user ? (user.displayName || user.email?.split('@')[0]) : 'Local User',
+      sessionId
+    });
 
     let unsubscribeVfs = () => {};
     let unsubscribeHistory = () => {};
@@ -295,12 +312,85 @@ export default function App() {
       }
     });
 
+    newSocket.on('sync_input', (data: { text: string, user: string }) => {
+      setInput(data.text);
+      if (data.user && data.user !== (user ? (user.displayName || user.email?.split('@')[0]) : 'Local User')) {
+        setTypingUser(data.user);
+      } else {
+        setTypingUser(null);
+      }
+    });
+
+    newSocket.on('gemini_chat_response', (data: any) => {
+      setGeminiLoading(false);
+      if (data.error) {
+        setGeminiChatHistory(prev => [...prev, { role: 'model', content: `Error: ${data.error}` }]);
+      } else {
+        setGeminiChatHistory(prev => [...prev, { role: 'model', content: data.text }]);
+      }
+    });
+
+    newSocket.on('gemini_generate_image_response', (data: any) => {
+      setGeminiLoading(false);
+      if (data.error) {
+        setGeminiChatHistory(prev => [...prev, { role: 'model', content: `Error generating image: ${data.error}` }]);
+      } else {
+        setGeminiChatHistory(prev => [...prev, { role: 'model', content: `Generated successfully: [File: ${data.filepath}]`, mediaUrl: data.url, mediaType: 'image' }]);
+      }
+    });
+
+    newSocket.on('gemini_generate_video_response', (data: any) => {
+      if (data.error) {
+        setGeminiLoading(false);
+        setGeminiChatHistory(prev => [...prev, { role: 'model', content: `Error initiating video generation: ${data.error}` }]);
+      } else {
+        setVideoOperationName(data.operationName);
+        setGeminiChatHistory(prev => [...prev, { role: 'model', content: `Video generation process initiated on Google Veo. Compiling frames...` }]);
+      }
+    });
+
+    newSocket.on('gemini_get_video_status_response', (data: any) => {
+      if (data.error) {
+        setGeminiLoading(false);
+        setVideoOperationName(null);
+        setGeminiChatHistory(prev => [...prev, { role: 'model', content: `Error generating video: ${data.error}` }]);
+      } else if (data.done) {
+        setGeminiLoading(false);
+        setVideoOperationName(null);
+        setGeminiChatHistory(prev => [...prev, { role: 'model', content: `Video generated successfully! [File: ${data.filepath}]`, mediaUrl: data.url, mediaType: 'video' }]);
+      }
+    });
+
+    newSocket.on('gemini_generate_code_response', (data: any) => {
+      setGeminiLoading(false);
+      if (data.error) {
+        setGeminiChatHistory(prev => [...prev, { role: 'model', content: `Error generating app: ${data.error}` }]);
+      } else {
+        setActiveSandbox(data.code);
+        setRightPanel('sandbox');
+        setGeminiChatHistory(prev => [...prev, { role: 'model', content: `Interactive web app generated and rendered in sandbox! [File: ${data.filepath}]` }]);
+      }
+    });
+
     return () => {
       newSocket.close();
       unsubscribeVfs();
       unsubscribeHistory();
     };
   }, [user]);
+
+  useEffect(() => {
+    if (!videoOperationName || !socket) return;
+    
+    const interval = setInterval(() => {
+      socket.emit('gemini_get_video_status', { 
+        operationName: videoOperationName,
+        prompt: geminiChatHistory[geminiChatHistory.length - 1]?.content || ''
+      });
+    }, 4000);
+
+    return () => clearInterval(interval);
+  }, [videoOperationName, socket, geminiChatHistory]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -356,14 +446,27 @@ export default function App() {
       user: user ? (user.displayName || user.email?.split('@')[0]) : 'Local User', 
       vfs,
       apiKeys,
-      defaultLlm
+      defaultLlm,
+      sandboxEnabled
     });
     setInput('');
+    socket?.emit('input_change', { text: '', timestamp: Date.now() });
+  };
+
+  const handleSendChat = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!chatInput.trim() || !socket) return;
+
+    socket.emit('chat_message', {
+      message: chatInput.trim()
+    });
+    setChatInput('');
   };
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value;
     setInput(val);
+    socket?.emit('input_change', { text: val, timestamp: Date.now() });
     if (!val) {
       setPrediction('');
       return;
@@ -391,6 +494,7 @@ export default function App() {
       e.preventDefault();
       if (prediction) {
         setInput(prediction);
+        socket?.emit('input_change', { text: prediction, timestamp: Date.now() });
         setPrediction('');
       }
     } else if (e.key === 'ArrowUp') {
@@ -398,17 +502,22 @@ export default function App() {
       if (commandHistory.length > 0) {
         const newIndex = historyIndex < commandHistory.length - 1 ? historyIndex + 1 : historyIndex;
         setHistoryIndex(newIndex);
-        setInput(commandHistory[commandHistory.length - 1 - newIndex]);
+        const txt = commandHistory[commandHistory.length - 1 - newIndex];
+        setInput(txt);
+        socket?.emit('input_change', { text: txt, timestamp: Date.now() });
       }
     } else if (e.key === 'ArrowDown') {
       e.preventDefault();
       if (historyIndex > 0) {
         const newIndex = historyIndex - 1;
         setHistoryIndex(newIndex);
-        setInput(commandHistory[commandHistory.length - 1 - newIndex]);
+        const txt = commandHistory[commandHistory.length - 1 - newIndex];
+        setInput(txt);
+        socket?.emit('input_change', { text: txt, timestamp: Date.now() });
       } else if (historyIndex === 0) {
         setHistoryIndex(-1);
         setInput('');
+        socket?.emit('input_change', { text: '', timestamp: Date.now() });
       }
     }
   };
@@ -458,6 +567,28 @@ export default function App() {
       case 'command':
         return <div key={entry.id} className="text-cyan-400 font-bold">{entry.text}</div>;
       case 'output':
+        if ((entry as any).isChat) {
+          const isMe = (entry as any).sender === (user ? (user.displayName || user.email?.split('@')[0]) : 'Local User');
+          return (
+            <div key={entry.id} className={`my-2 flex ${isMe ? 'justify-end' : 'justify-start'}`}>
+              <div className={`p-3 rounded-lg max-w-[85%] sm:max-w-md ${
+                isMe 
+                  ? 'bg-purple-950/40 text-purple-200 border border-purple-500/30' 
+                  : 'bg-cyan-950/30 text-cyan-200 border border-cyan-500/20'
+              }`}>
+                <div className="flex items-center justify-between gap-4 mb-1 border-b border-white/5 pb-1">
+                  <span className={`text-[10px] uppercase font-bold tracking-wider ${isMe ? 'text-purple-400' : 'text-cyan-400'}`}>
+                    {(entry as any).sender || 'Anonymous'}
+                  </span>
+                  <span className="text-[9px] text-gray-500 font-mono">
+                    {entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                  </span>
+                </div>
+                <div className="text-sm break-words whitespace-pre-wrap">{entry.text}</div>
+              </div>
+            </div>
+          );
+        }
         return <div key={entry.id} className="text-gray-300 whitespace-pre-wrap">{entry.text}</div>;
       case 'error':
         return <div key={entry.id} className="text-red-400">{entry.text}</div>;
@@ -636,16 +767,51 @@ export default function App() {
 
       {/* Main Terminal Area */}
       <div className="flex-1 flex flex-col relative">
-        <div className="p-4 border-b border-gray-800 flex items-center justify-between bg-[#111]">
-          <div className="flex items-center gap-2 text-cyan-400">
+        <div className="p-4 border-b border-gray-800 flex items-center justify-between bg-[#111] flex-wrap gap-2">
+          <div className="flex items-center gap-3 text-cyan-400 flex-wrap">
             <TerminalIcon size={18} />
             <span className="font-bold tracking-wider">AETHER_TERM v2.0</span>
+            <div className="h-4 w-px bg-gray-800" />
+            <span className="text-xs text-purple-400 font-mono flex items-center gap-1 bg-purple-950/30 px-2 py-0.5 rounded border border-purple-500/20">
+              <Users size={12} />
+              Session: <span className="font-bold text-white uppercase">{sessionId}</span>
+            </span>
+            <button
+              onClick={() => {
+                let currentSession = new URLSearchParams(window.location.search).get('session');
+                if (!currentSession) {
+                  const randomCode = Math.random().toString(36).substring(2, 7);
+                  currentSession = randomCode;
+                  const newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname + '?session=' + randomCode;
+                  window.history.pushState({ path: newUrl }, '', newUrl);
+                  setSessionId(randomCode);
+                  socket?.emit('join', {
+                    username: user ? (user.displayName || user.email?.split('@')[0]) : 'Local User',
+                    sessionId: randomCode
+                  });
+                }
+                const shareLink = window.location.href;
+                navigator.clipboard.writeText(shareLink).then(() => {
+                  setHistory(prev => [...prev, { id: Date.now().toString(), type: 'output', timestamp: Date.now(), userId: user?.uid || 'local', text: `[System]: Link copied to clipboard! Share it with collaborators to join room '${currentSession}': ${shareLink}` }]);
+                });
+              }}
+              className="text-[11px] bg-cyan-950/50 text-cyan-400 hover:bg-cyan-900/60 border border-cyan-500/30 px-2.5 py-1 rounded transition-colors font-mono flex items-center gap-1"
+              title="Copy session link to invite others"
+            >
+              <Copy size={11} />
+              Invite Collaborators
+            </button>
           </div>
-          <div className="text-xs text-gray-500 flex gap-4">
-            <span>Try: play &lt;url&gt;</span>
-            <span>view &lt;url&gt;</span>
-            <span>ask &lt;prompt&gt;</span>
-            <span>generate-app &lt;prompt&gt;</span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                setRightPanel(rightPanel === 'gemini-chat' ? null : 'gemini-chat');
+              }}
+              className={`px-3 py-1 rounded text-xs transition-all flex items-center gap-1.5 font-mono ${rightPanel === 'gemini-chat' ? 'bg-purple-600 hover:bg-purple-500 text-white shadow-lg shadow-purple-500/20' : 'bg-purple-950/40 text-purple-300 border border-purple-500/30 hover:bg-purple-900/40'}`}
+            >
+              <Sparkles size={13} className="animate-pulse" />
+              Gemini Workspace
+            </button>
           </div>
         </div>
 
@@ -662,37 +828,98 @@ export default function App() {
           <div ref={bottomRef} />
         </div>
 
-        <form onSubmit={handleCommand} className="p-4 bg-[#111] border-t border-gray-800 flex items-center gap-3 relative">
-          <div className="absolute -top-8 right-4 flex items-center gap-2 text-xs text-gray-500 bg-[#111] px-3 py-1 rounded-t border border-b-0 border-gray-800">
-            <Wifi size={12} className={user ? "text-green-500" : "text-gray-500"} />
-            <span>{onlineUsers.length} User{onlineUsers.length !== 1 ? 's' : ''} Online</span>
-          </div>
-          <span className="text-cyan-500 font-bold">nexus@rayne:~$</span>
-          <div className="flex-1 relative flex items-center">
-            {prediction && prediction !== input && (
-              <span className="absolute left-0 text-gray-600 pointer-events-none whitespace-pre">
-                {input}<span className="opacity-50">{prediction.slice(input.length)}</span>
-              </span>
-            )}
-            <input
-              type="text"
-              value={input}
-              onChange={handleInputChange}
-              onKeyDown={handleKeyDown}
-              className="w-full bg-transparent outline-none text-gray-200 placeholder-gray-700 relative z-10"
-              placeholder="Enter command or click mic..."
-              autoFocus
-            />
-          </div>
-          <button 
-            type="button"
-            onClick={toggleVoiceCommand}
-            className={`p-2 rounded transition-colors ${isListening ? 'bg-red-500/20 text-red-500 animate-pulse' : 'text-gray-500 hover:text-cyan-400 hover:bg-gray-800'}`}
-            title="Voice Command"
+        <div id="terminal-footer-container" className="bg-[#111] border-t border-gray-800 flex flex-col">
+          {/* Terminal Command Input */}
+          <form 
+            id="terminal-command-form" 
+            onSubmit={handleCommand} 
+            className="px-4 py-2.5 flex items-center gap-3 relative border-b border-gray-900/80"
           >
-            {isListening ? <Mic size={18} /> : <MicOff size={18} />}
-          </button>
-        </form>
+            <span className="text-cyan-500 font-bold font-mono text-xs sm:text-sm whitespace-nowrap">nexus@rayne:~$</span>
+            <div className="flex-1 relative flex items-center">
+              {prediction && prediction !== input && (
+                <span className="absolute left-0 text-gray-600 pointer-events-none whitespace-pre text-xs sm:text-sm font-mono">
+                  {input}<span className="opacity-50">{prediction.slice(input.length)}</span>
+                </span>
+              )}
+              <input
+                id="terminal-command-input"
+                type="text"
+                value={input}
+                onChange={handleInputChange}
+                onKeyDown={handleKeyDown}
+                className="w-full bg-transparent outline-none text-gray-200 placeholder-gray-700 font-mono text-xs sm:text-sm relative z-10"
+                placeholder="Enter command (e.g., help, play <url> or click mic)..."
+                autoFocus
+              />
+              {typingUser && (
+                <span className="absolute right-2 text-[10px] text-purple-400 font-mono italic animate-pulse bg-purple-950/40 px-2 py-0.5 rounded border border-purple-500/20 z-20">
+                  {typingUser} is typing...
+                </span>
+              )}
+            </div>
+            <button 
+              id="terminal-voice-btn"
+              type="button"
+              onClick={toggleVoiceCommand}
+              className={`p-1.5 rounded transition-colors ${isListening ? 'bg-red-500/20 text-red-500 animate-pulse' : 'text-gray-500 hover:text-cyan-400 hover:bg-gray-800'}`}
+              title="Voice Command"
+            >
+              {isListening ? <Mic size={16} /> : <MicOff size={16} />}
+            </button>
+            <button
+              type="button"
+              onClick={() => setSandboxEnabled(!sandboxEnabled)}
+              className={`p-1.5 px-2.5 rounded text-xs transition-all font-mono flex items-center gap-1.5 ${sandboxEnabled ? 'bg-amber-600/30 text-amber-300 border border-amber-500/50' : 'text-gray-500 border border-transparent hover:text-cyan-400'}`}
+              title="Toggle Sandboxed Isolation Mode for Untrusted Code"
+            >
+              <Shield size={14} className={sandboxEnabled ? "animate-pulse text-amber-400" : ""} />
+              {sandboxEnabled ? 'SANDBOX ON' : 'SANDBOX OFF'}
+            </button>
+            <button 
+              id="terminal-run-btn"
+              type="submit"
+              className={`p-1.5 rounded transition-all flex items-center justify-center ${input.trim() ? 'text-cyan-400 bg-cyan-950/30 hover:bg-cyan-900/40 border border-cyan-500/30' : 'text-gray-500 hover:text-cyan-400'}`}
+              title="Run Command"
+            >
+              <Send size={16} />
+            </button>
+          </form>
+
+          {/* Dedicated Chat Input */}
+          <form 
+            id="terminal-chat-form"
+            onSubmit={handleSendChat} 
+            className="px-4 py-3 flex items-center gap-3 bg-[#0d0d0d] relative"
+          >
+            <div className="absolute -top-8 right-4 flex items-center gap-2 text-[10px] text-gray-400 bg-[#111] px-2.5 py-0.5 rounded-t border border-b-0 border-gray-800 z-20 font-mono">
+              <Wifi size={10} className={user ? "text-green-500" : "text-gray-500"} />
+              <span>{onlineUsers.length} Online</span>
+            </div>
+            <div className="flex items-center gap-1.5 text-purple-400 shrink-0 select-none">
+              <Users size={14} />
+              <span className="text-[10px] uppercase tracking-wider font-bold text-purple-400/80 font-mono">Chat</span>
+            </div>
+            <div className="flex-1">
+              <input
+                id="terminal-chat-input"
+                type="text"
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                className="w-full bg-transparent outline-none text-gray-200 placeholder-gray-600 text-xs sm:text-sm"
+                placeholder="Message collaborators (instant chat)..."
+              />
+            </div>
+            <button 
+              id="terminal-chat-send-btn"
+              type="submit"
+              className={`p-1.5 rounded transition-all flex items-center justify-center ${chatInput.trim() ? 'text-purple-400 bg-purple-950/30 hover:bg-purple-900/40 border border-purple-500/30' : 'text-gray-500 hover:text-purple-400'}`}
+              title="Send Chat Message"
+            >
+              <Send size={15} />
+            </button>
+          </form>
+        </div>
       </div>
 
       {/* Right Sidebar - Sandbox / Editor */}
@@ -943,6 +1170,137 @@ export default function App() {
                 spellCheck={false}
               />
             </div>
+          </motion.div>
+        )}
+
+        {rightPanel === 'gemini-chat' && (
+          <motion.div 
+            initial={{ width: 0, opacity: 0 }}
+            animate={{ width: '40%', opacity: 1 }}
+            exit={{ width: 0, opacity: 0 }}
+            className="border-l border-gray-800 bg-[#0d0f14] flex flex-col overflow-hidden w-full max-w-[500px]"
+          >
+            <div className="p-4 bg-[#111] border-b border-gray-800 flex items-center justify-between text-gray-200">
+              <div className="flex items-center gap-2 text-purple-400">
+                <Sparkles size={18} className="animate-pulse" />
+                <span className="font-bold tracking-wider font-mono text-sm">GEMINI AI WORKSPACE</span>
+              </div>
+              <button 
+                onClick={() => setRightPanel(null)}
+                className="text-gray-400 hover:text-white transition-colors"
+              >
+                <Minimize2 size={18} />
+              </button>
+            </div>
+
+            <div className="p-3 bg-[#141822] border-b border-gray-800 flex gap-1.5 flex-wrap">
+              {[
+                { id: 'chat', label: 'Conversational', icon: <Bot size={12} /> },
+                { id: 'code', label: 'Generate App', icon: <Code size={12} /> },
+                { id: 'image', label: 'Text-to-Image', icon: <ImageIcon size={12} /> },
+                { id: 'video', label: 'Veo Video', icon: <Video size={12} /> }
+              ].map(mode => (
+                <button
+                  key={mode.id}
+                  onClick={() => setGeminiMode(mode.id as any)}
+                  className={`px-2.5 py-1 rounded text-xs font-mono transition-all flex items-center gap-1 ${geminiMode === mode.id ? 'bg-purple-600 text-white shadow-md' : 'bg-gray-900 text-gray-400 hover:bg-gray-850'}`}
+                >
+                  {mode.icon}
+                  {mode.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {geminiChatHistory.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-4 font-mono select-none">
+                  <div className="relative">
+                    <Sparkles size={40} className="text-purple-500 animate-pulse" />
+                    <div className="absolute inset-0 bg-purple-500 blur-lg opacity-20" />
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-gray-300 text-sm font-bold">Systems Ready</p>
+                    <p className="text-gray-500 text-xs max-w-[280px]">Converse with Gemini to generate single-file web applications, cinematic visual graphics, and motion clips.</p>
+                  </div>
+                </div>
+              ) : (
+                geminiChatHistory.map((item, idx) => (
+                  <div key={idx} className={`flex flex-col space-y-1.5 ${item.role === 'user' ? 'items-end' : 'items-start'}`}>
+                    <span className="text-[10px] text-gray-500 uppercase tracking-widest font-mono font-bold">
+                      {item.role === 'user' ? 'user' : 'gemini'}
+                    </span>
+                    <div className={`p-3 rounded-lg max-w-[90%] font-mono text-xs whitespace-pre-wrap break-words leading-relaxed ${item.role === 'user' ? 'bg-[#1e152a] text-purple-200 border border-purple-500/20' : 'bg-[#0f141c] text-gray-200 border border-gray-800'}`}>
+                      {item.content}
+                      {item.mediaUrl && item.mediaType === 'image' && (
+                        <div className="mt-3 overflow-hidden rounded border border-gray-800">
+                          <img src={item.mediaUrl} alt="Gemini generation" className="w-full h-auto object-cover" referrerPolicy="no-referrer" />
+                        </div>
+                      )}
+                      {item.mediaUrl && item.mediaType === 'video' && (
+                        <div className="mt-3 overflow-hidden rounded border border-gray-800">
+                          <video src={item.mediaUrl} controls className="w-full h-auto object-cover" />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+              {geminiLoading && (
+                <div className="flex items-center gap-2 text-purple-400 font-mono text-xs italic animate-pulse">
+                  <Wand2 size={14} className="animate-spin" />
+                  <span>AI compiler running routines...</span>
+                </div>
+              )}
+            </div>
+
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (!geminiPrompt.trim() || !socket || geminiLoading) return;
+                
+                const query = geminiPrompt.trim();
+                setGeminiPrompt('');
+                setGeminiLoading(true);
+
+                setGeminiChatHistory(prev => [...prev, { role: 'user', content: query }]);
+
+                if (geminiMode === 'chat') {
+                  socket.emit('gemini_chat', {
+                    message: query,
+                    history: geminiChatHistory.filter(h => !h.mediaUrl).map(h => ({ role: h.role, content: h.content }))
+                  });
+                } else if (geminiMode === 'code') {
+                  socket.emit('gemini_generate_code', { prompt: query });
+                } else if (geminiMode === 'image') {
+                  socket.emit('gemini_generate_image', { prompt: query });
+                } else if (geminiMode === 'video') {
+                  socket.emit('gemini_generate_video', { prompt: query });
+                }
+              }}
+              className="p-3 border-t border-gray-800 bg-[#111]"
+            >
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={geminiPrompt}
+                  onChange={(e) => setGeminiPrompt(e.target.value)}
+                  className="flex-1 bg-black text-gray-200 text-xs font-mono p-2.5 rounded outline-none border border-gray-850 focus:border-purple-500/50"
+                  placeholder={
+                    geminiMode === 'chat' ? "Converse with Gemini..." :
+                    geminiMode === 'code' ? "Describe the app to build (e.g., calculator)..." :
+                    geminiMode === 'image' ? "Describe image (e.g., cyberpunk street)..." :
+                    "Describe video (e.g., a serene lake under sunset)..."
+                  }
+                />
+                <button
+                  type="submit"
+                  disabled={geminiLoading || !geminiPrompt.trim()}
+                  className="bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white rounded p-2.5 transition-colors"
+                >
+                  <Send size={14} />
+                </button>
+              </div>
+            </form>
           </motion.div>
         )}
       </AnimatePresence>
